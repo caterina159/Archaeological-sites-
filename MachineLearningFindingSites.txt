@@ -1,0 +1,175 @@
+//Code adapted by Caterina from the paper Orengo et al. 2020. 
+/*Automated detection of archaeological mounds 
+using machine-learning classification of multisensor and multitemporal 
+satellite data. PNAS 117 (31): 18240-18250. 
+
+//Add the study area
+var aoiKut = ee.FeatureCollection('users/kericaterina/aoiKut');
+Map.addLayer(aoiKut,{},'AOI Kut area');*/
+//and center it on the map
+Map.centerObject(aoiKut, 9);
+
+// Load the Sentinel-1 imagery
+//Clip to the AOI and filter by dates of interest
+//Filter to get images with VV and VH polarization, different look angles
+//and  images collected in interferometric wide swath mode
+
+
+var s1_VV = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoiKut)
+  .filterDate('2015-06-01', '2020-08-31')
+  .filterDate('2014-12-01', '2020-02-29')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV');
+
+var desc_VV = s1_VV.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+var asc_VV = s1_VV.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+
+
+
+var s1_VH = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(aoiKut)
+  .filterDate('2015-06-01', '2020-08-31')
+  .filterDate('2014-12-01', '2020-02-29')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VH');
+
+var desc_VH = s1_VH.filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'));
+var asc_VH = s1_VH.filter(ee.Filter.eq('orbitProperties_pass', 'ASCENDING'));
+
+// Print total Sentinel 1 images employed
+//print('Sentinel 1 images:', s1_VH);
+//Composite of Sentinel 1
+var bands_s1 = ['VV','VH'];
+var s1_composite = ee.Image.cat(s1_VV.median(), s1_VH.median()).select(bands_s1).clip(aoiKut);
+
+
+//Load the Sentinel-2 collection.
+//Choose the area and filter the imagery date range
+
+
+var s2_collection = ee.ImageCollection("COPERNICUS/S2")
+  .filterBounds(aoiKut)
+  .filterDate('2014-12-01', '2020-02-29')
+  .filterDate('2015-06-01', '2020-08-31')
+  .filterMetadata('CLOUDY_PIXEL_PERCENTAGE', 'less_than', 1);
+
+
+/*Creating the Composite of Sentinel-2. Use image division to create contrast
+between features in the resulting image*/
+//Clip the resulting image to the area of interest and choose the bands useful to map tells 
+var medianpixels = s2_collection.median(); // This finds the median value of all the pixels which meet the criteria. 
+// this cuts up the result so that it fits neatly into my area rectangle
+                                                                  // and divides so that values between 0 and 1      
+var bands_s2 =  ['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+var s2_composite = medianpixels.select(bands_s2).clip(aoiKut).divide(10000);
+
+
+//Create the full composite
+var bands = ['VV', 'VH', 'B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12'];
+var composite = ee.Image.cat([s2_composite, s1_composite]).select(bands).clip(aoiKut);
+Map.addLayer(composite, {min: -25, max: 10},"composite",true);
+//Machine learning Random Forest classifier
+
+// Call training data for the feature collection named sites 
+//referring to archaeological mounds
+
+//But first add manually found mounds
+
+var tells = ee.FeatureCollection('users/kericaterina/tells');
+Map.addLayer(tells,{},'Manual Mounds some tells');
+
+var tells2 = ee.FeatureCollection('users/kericaterina/tells2');
+Map.addLayer(tells2,{},'Manual Mounds other tells');
+
+Map.addLayer(geometrysmall_otherTells, {}, "More manual tells");
+// Train data for full composite. 
+//Merge training data
+var training1 = ee.FeatureCollection('users/kericaterina/training1');
+var training2 = ee.FeatureCollection('users/kericaterina/training2');
+Map.addLayer(training1, {}, "training 1 data");
+Map.addLayer(training2, {}, "training 2 data");
+var trn_pols = training1.merge(training2);
+var training = composite.clip(aoiKut).select(bands).sampleRegions({
+  collection: trn_pols,
+  properties: ['class'],
+  scale: 10
+});
+
+//export training data as assets
+//Export.table.toAsset(training1);
+//Export.table.toAsset(training2);
+
+// Apply RF classifier calling mode "probability"
+var classifier = ee.Classifier.smileRandomForest({'numberOfTrees':128})
+  .setOutputMode('PROBABILITY').train({
+  features: training,
+  classProperty: 'class',
+  inputProperties: bands
+});
+
+// Create classified probability raster on both the entire study area 
+var classified = composite.clip(aoiKut).select(bands).classify(classifier);
+
+// Add the resulting classified layer to the Map Window below
+Map.addLayer(classified, {min: 0.55, max: 1, palette: ['green', 'red','blue', 'black', 'brown']}, 'random classif', true);
+//And on a smaller test area within the larger area
+var class_small = composite.clip(smallArea_geometry3).select(bands).classify(classifier);
+Map.addLayer(class_small, {min: 0.55, max: 1, palette: ['green', 'red','blue', 'black', 'brown']}, 'random classif small area', true);
+//Add the small area from assets
+var smallArea_geometry3 = ee.FeatureCollection('users/kericaterina/smallArea_geometry3');
+Map.addLayer(smallArea_geometry3,{},'Small test area - geometry3');
+
+
+//Train the classifier on a smaller area within the larger area
+//to filter false positives/negatives
+
+
+//Filter predicted mounds(by script) in the entire study area based on high probability
+var mound_rast = classified.mask(classified.gte(0.98)).focalMode(3);
+Map.addLayer(mound_rast,{palette: 'red'},"filtered detected mounds on large area");
+
+//And on smaller area also
+var mound_rast_small = class_small.mask(class_small.gte(0.98)).focalMode(3);
+Map.addLayer(mound_rast_small, {palette: 'blue'},"filtered detected mounds small area");
+
+
+//Add the manual mounds sample area to the map from the assets
+var manual_tells_sample_area = ee.FeatureCollection('users/kericaterina/Manual_tells_test_area');
+Map.addLayer(manual_tells_sample_area, {}, "manual tells test area");
+
+//Export the necessary rasters for the analysis of the sample small area
+//Export the manual tells in the sample area to drive
+/*Export.table.toDrive({
+
+  collection: manual_tells_sample_area,
+  description: ['test area manual mounds'],
+  fileFormat: 'SHP'
+});*/
+
+//export the composite to drive
+/*Export.image.toDrive({
+ image: composite,
+
+ description: 'composite Sentinel',
+
+  scale: 10,
+
+  maxPixels: 1e13,
+
+  region: smallArea_geometry3,
+
+  crs: 'EPSG:4326'
+
+});
+
+//export other  mounds from the small area
+Export.table.toDrive({
+
+  collection: geometrysmall_otherTells,
+  description: ['test area other manual mounds'],
+  fileFormat: 'SHP'
+});*/
+
